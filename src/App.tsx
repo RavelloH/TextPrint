@@ -163,31 +163,6 @@ function App() {
     highlightSummaryTrackedRef.current = true
   }, [highlightStatus, previewSummaryPending, syntaxHighlight])
 
-  const closeDialog = useCallback((source: 'button' | 'backdrop' | 'escape' = 'button') => {
-    const dialog = dialogRef.current
-    if (!dialog?.open || dialog.classList.contains('is-closing')) return
-    const openedAt = previewOpenedAtRef.current
-    if (isIOS && pdfStatus === 'working' && !pdfGenerationResultTrackedRef.current) {
-      pdfGenerationResultTrackedRef.current = true
-      trackEvent('pdf_generation_result', { status: 'cancelled', reason: 'preview_closed', page_count: pages.length, resolution_dpi: 220 })
-    }
-    trackEvent('preview_closed', {
-      source,
-      duration_bucket: openedAt === null ? 'unknown' : durationBucket(performance.now() - openedAt),
-    })
-    setPreviewSummaryPending(true)
-    previewOpenedAtRef.current = null
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { dialog.close(); setPreviewOpen(false); return }
-    dialog.classList.add('is-closing')
-    closeTimerRef.current = setTimeout(() => {
-      dialog.close()
-      setPreviewOpen(false)
-      dialog.classList.remove('is-closing')
-      closeTimerRef.current = null
-    }, 200)
-  }, [isIOS, pages.length, pdfStatus])
-  useEffect(() => () => { if (closeTimerRef.current) clearTimeout(closeTimerRef.current) }, [])
-
   const rawSize = paper === 'custom' ? [customWidth, customHeight] : PAPER[paper]
   const [width, height] = orientation === 'portrait' ? rawSize : [rawSize[1], rawSize[0]]
   const family = FONTS.find((item) => item.value === font)?.family ?? FONTS[0].family
@@ -234,6 +209,30 @@ function App() {
     line_count_bucket: countBucket(normalizedText.trim() ? normalizedText.split('\n').length : 0),
     page_count: pages.length,
   })
+  const closeDialog = useCallback((source: 'button' | 'backdrop' | 'escape' = 'button') => {
+    const dialog = dialogRef.current
+    if (!dialog?.open || dialog.classList.contains('is-closing')) return
+    const openedAt = previewOpenedAtRef.current
+    if (isIOS && pdfStatus === 'working' && !pdfGenerationResultTrackedRef.current) {
+      pdfGenerationResultTrackedRef.current = true
+      trackEvent('pdf_generation_result', { status: 'cancelled', reason: 'preview_closed', page_count: pages.length, resolution_dpi: 220 })
+    }
+    trackEvent('preview_closed', {
+      source,
+      duration_bucket: openedAt === null ? 'unknown' : durationBucket(performance.now() - openedAt),
+    })
+    setPreviewSummaryPending(true)
+    previewOpenedAtRef.current = null
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { dialog.close(); setPreviewOpen(false); return }
+    dialog.classList.add('is-closing')
+    closeTimerRef.current = setTimeout(() => {
+      dialog.close()
+      setPreviewOpen(false)
+      dialog.classList.remove('is-closing')
+      closeTimerRef.current = null
+    }, 200)
+  }, [isIOS, pages.length, pdfStatus])
+  useEffect(() => () => { if (closeTimerRef.current) clearTimeout(closeTimerRef.current) }, [])
   useEffect(() => {
     if (!isIOS || !previewOpen || (syntaxHighlight && highlightStatus === 'working')) return
     let cancelled = false
