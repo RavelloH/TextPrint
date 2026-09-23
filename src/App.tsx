@@ -96,12 +96,15 @@ function App() {
   const [highlightResult, setHighlightResult] = useState<{ source: string; spans: SyntaxSpan[] } | null>(null)
   const [highlightStatus, setHighlightStatus] = useState<'idle' | 'working' | 'ready' | 'unsupported' | 'error'>('idle')
   const [previewOpen, setPreviewOpen] = useState(false)
+  const [previewSummaryPending, setPreviewSummaryPending] = useState(false)
   const [pdfBlob, setPdfBlob] = useState<Blob | null>(null)
   const [pdfStatus, setPdfStatus] = useState<'idle' | 'working' | 'ready' | 'error'>('idle')
   const dialogRef = useRef<HTMLDialogElement>(null)
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const previewOpenedAtRef = useRef<number | null>(null)
-  const highlightUnsupportedTrackedRef = useRef(false)
+  const highlightDurationBucketRef = useRef<string | null>(null)
+  const pdfGenerationResultTrackedRef = useRef(false)
+  const highlightSummaryTrackedRef = useRef(false)
   const normalizedText = text.replace(/\r\n?/g, '\n').replace(/\t/g, '    ')
   const spans = syntaxHighlight && highlightStatus === 'ready' && highlightResult?.source === normalizedText ? highlightResult.spans : EMPTY_SPANS
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
@@ -109,21 +112,18 @@ function App() {
   useEffect(() => {
     if (!syntaxHighlight || !normalizedText.trim()) {
       setHighlightStatus('idle')
-      highlightUnsupportedTrackedRef.current = false
+      highlightDurationBucketRef.current = null
       return
     }
     if (!('gpu' in navigator)) {
       setHighlightStatus('unsupported')
-      if (!highlightUnsupportedTrackedRef.current) {
-        trackEvent('syntax_highlight_unavailable', { reason: 'webgpu_unsupported' })
-        highlightUnsupportedTrackedRef.current = true
-      }
+      highlightDurationBucketRef.current = null
       return
     }
     let cancelled = false
     const startedAt = performance.now()
     setHighlightStatus('working')
-    trackEvent('syntax_highlight_started')
+    highlightDurationBucketRef.current = null
     const timer = setTimeout(async () => {
       try {
         const { parse } = await import('gpu-lexer')
@@ -131,26 +131,51 @@ function App() {
         if (!cancelled) {
           setHighlightResult({ source: normalizedText, spans: result })
           setHighlightStatus('ready')
-          trackEvent('syntax_highlight_completed', { duration_bucket: durationBucket(performance.now() - startedAt) })
+          highlightDurationBucketRef.current = durationBucket(performance.now() - startedAt)
         }
       } catch {
         if (!cancelled) {
           setHighlightStatus('error')
-          trackEvent('syntax_highlight_failed', { reason: 'parser_error', duration_bucket: durationBucket(performance.now() - startedAt) })
+          highlightDurationBucketRef.current = durationBucket(performance.now() - startedAt)
         }
       }
     }, 180)
     return () => { cancelled = true; clearTimeout(timer) }
   }, [syntaxHighlight, normalizedText])
 
+  useEffect(() => {
+    if (!previewSummaryPending || highlightSummaryTrackedRef.current) return
+    if (syntaxHighlight && (highlightStatus === 'idle' || highlightStatus === 'working')) return
+    const status = !syntaxHighlight
+      ? 'disabled'
+      : highlightStatus === 'ready'
+        ? 'succeeded'
+        : highlightStatus === 'error'
+          ? 'failed'
+          : highlightStatus === 'unsupported'
+            ? 'unsupported'
+            : 'not_run'
+    trackEvent('syntax_highlight_result', {
+      enabled: syntaxHighlight,
+      status,
+      ...(highlightDurationBucketRef.current === null ? {} : { duration_bucket: highlightDurationBucketRef.current }),
+    })
+    highlightSummaryTrackedRef.current = true
+  }, [highlightStatus, previewSummaryPending, syntaxHighlight])
+
   const closeDialog = useCallback((source: 'button' | 'backdrop' | 'escape' = 'button') => {
     const dialog = dialogRef.current
     if (!dialog?.open || dialog.classList.contains('is-closing')) return
     const openedAt = previewOpenedAtRef.current
+    if (isIOS && pdfStatus === 'working' && !pdfGenerationResultTrackedRef.current) {
+      pdfGenerationResultTrackedRef.current = true
+      trackEvent('pdf_generation_result', { status: 'cancelled', reason: 'preview_closed', page_count: pages.length, resolution_dpi: 220 })
+    }
     trackEvent('preview_closed', {
       source,
       duration_bucket: openedAt === null ? 'unknown' : durationBucket(performance.now() - openedAt),
     })
+    setPreviewSummaryPending(true)
     previewOpenedAtRef.current = null
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { dialog.close(); setPreviewOpen(false); return }
     dialog.classList.add('is-closing')
@@ -160,7 +185,7 @@ function App() {
       dialog.classList.remove('is-closing')
       closeTimerRef.current = null
     }, 200)
-  }, [])
+  }, [isIOS, pages.length, pdfStatus])
   useEffect(() => () => { if (closeTimerRef.current) clearTimeout(closeTimerRef.current) }, [])
 
   const rawSize = paper === 'custom' ? [customWidth, customHeight] : PAPER[paper]
@@ -215,21 +240,23 @@ function App() {
     const startedAt = performance.now()
     setPdfStatus('working')
     setPdfBlob(null)
-    trackEvent('pdf_generation_started', { page_count: pages.length, resolution_dpi: 220 })
+    pdfGenerationResultTrackedRef.current = false
     import('./printPdf').then(({ createPrintPdf }) => createPrintPdf({
       pages, spans, paper, width: safeWidth, height: safeHeight, margin: safeMargin,
       columns, columnGap, columnWidth, fontSize, family, color, alignment,
       footerMode, footerDate, footerHost, syntaxColors: SYNTAX_COLORS,
     })).then((blob) => {
-      if (!cancelled) {
+      if (!cancelled && !pdfGenerationResultTrackedRef.current) {
         setPdfBlob(blob)
         setPdfStatus('ready')
-        trackEvent('pdf_generation_succeeded', { page_count: pages.length, duration_bucket: durationBucket(performance.now() - startedAt) })
+        trackEvent('pdf_generation_result', { status: 'succeeded', page_count: pages.length, resolution_dpi: 220, duration_bucket: durationBucket(performance.now() - startedAt) })
+        pdfGenerationResultTrackedRef.current = true
       }
     }).catch(() => {
-      if (!cancelled) {
+      if (!cancelled && !pdfGenerationResultTrackedRef.current) {
         setPdfStatus('error')
-        trackEvent('pdf_generation_failed', { page_count: pages.length, duration_bucket: durationBucket(performance.now() - startedAt) })
+        trackEvent('pdf_generation_result', { status: 'failed', page_count: pages.length, resolution_dpi: 220, duration_bucket: durationBucket(performance.now() - startedAt) })
+        pdfGenerationResultTrackedRef.current = true
       }
     })
     return () => { cancelled = true }
@@ -237,34 +264,41 @@ function App() {
 
   const print = async () => {
     if (!isIOS) {
-      trackEvent('system_print_requested', analyticsLayout())
-      window.print()
+      const startedAt = performance.now()
+      try {
+        window.print()
+        trackEvent('system_print_result', { ...analyticsLayout(), status: 'request_returned', duration_bucket: durationBucket(performance.now() - startedAt) })
+      } catch {
+        trackEvent('system_print_result', { ...analyticsLayout(), status: 'failed', reason: 'print_error' })
+      }
       return
     }
     if (!pdfBlob) return
     const file = new File([pdfBlob], 'TextPrint.pdf', { type: 'application/pdf' })
     if (navigator.canShare?.({ files: [file] }) && navigator.share) {
-      trackEvent('pdf_share_started', { page_count: pages.length })
       try {
         await navigator.share({ files: [file] })
-        trackEvent('pdf_share_completed', { page_count: pages.length })
+        trackEvent('pdf_share_result', { status: 'completed', page_count: pages.length })
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
-          trackEvent('pdf_share_cancelled', { page_count: pages.length })
+          trackEvent('pdf_share_result', { status: 'cancelled', page_count: pages.length })
         } else {
           setPdfStatus('error')
-          trackEvent('pdf_share_failed', { page_count: pages.length, reason: 'share_error' })
+          trackEvent('pdf_share_result', { status: 'failed', page_count: pages.length, reason: 'share_error' })
         }
       }
     } else {
       const url = URL.createObjectURL(pdfBlob)
       window.open(url, '_blank', 'noopener')
-      trackEvent('pdf_fallback_open_requested', { page_count: pages.length })
+      trackEvent('pdf_share_result', { status: 'fallback_requested', page_count: pages.length })
       setTimeout(() => URL.revokeObjectURL(url), 60_000)
     }
   }
   const openPreview = () => {
     previewOpenedAtRef.current = performance.now()
+    highlightSummaryTrackedRef.current = false
+    pdfGenerationResultTrackedRef.current = false
+    setPreviewSummaryPending(false)
     trackEvent('preview_opened', analyticsLayout())
     setPdfBlob(null)
     setPdfStatus('working')
@@ -310,7 +344,7 @@ function App() {
           </div>
           <div className="align-row"><span>对齐</span><div className="segmented" role="group" aria-label="文字对齐">{([['left','左对齐'],['center','居中'],['right','右对齐']] as const).map(([value,label]) => <button type="button" key={value} className={alignment === value ? 'active' : ''} onClick={() => { setAlignment(value); trackEvent('setting_changed', { setting: 'alignment', value }) }} aria-pressed={alignment === value}>{label}</button>)}</div></div>
           <div className="highlight-row">
-            <label className="highlight-option"><input type="checkbox" checked={syntaxHighlight} onChange={(event) => { const enabled = event.target.checked; setSyntaxHighlight(enabled); trackEvent('syntax_highlight_toggled', { enabled }) }} /><span className="setting-check" aria-hidden="true">{syntaxHighlight ? '✓' : ''}</span><span>语法高亮</span></label>
+            <label className="highlight-option"><input type="checkbox" checked={syntaxHighlight} onChange={(event) => setSyntaxHighlight(event.target.checked)} /><span className="setting-check" aria-hidden="true">{syntaxHighlight ? '✓' : ''}</span><span>语法高亮</span></label>
             {syntaxHighlight && highlightStatus === 'working' && <p className="highlight-status" role="status">正在分析文字…</p>}
             {syntaxHighlight && highlightStatus === 'unsupported' && <p className="highlight-status" role="status">当前浏览器不支持 WebGPU</p>}
             {syntaxHighlight && highlightStatus === 'error' && <p className="highlight-status" role="status">高亮未能运行</p>}
