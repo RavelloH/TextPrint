@@ -7,6 +7,7 @@ type Paper = 'A3' | 'A4' | 'A5' | 'A6' | 'Letter' | 'custom'
 type Orientation = 'portrait' | 'landscape'
 type Alignment = 'left' | 'center' | 'right'
 type FooterMode = 'all' | 'page' | 'none'
+type NumericDraftKey = 'columnGap' | 'customWidth' | 'customHeight' | 'fontSize' | 'margin'
 const PAPER: Record<Exclude<Paper, 'custom'>, [number, number]> = {
   A3: [297, 420], A4: [210, 297], A5: [148, 210], A6: [105, 148], Letter: [216, 279],
 }
@@ -92,6 +93,13 @@ function App() {
   const [fontSize, setFontSize] = useState(12)
   const [color, setColor] = useState('#1a1d20')
   const [alignment, setAlignment] = useState<Alignment>('left')
+  const [numericDrafts, setNumericDrafts] = useState<Record<NumericDraftKey, string>>(() => ({
+    columnGap: String(columnGap),
+    customWidth: String(customWidth),
+    customHeight: String(customHeight),
+    fontSize: String(fontSize),
+    margin: String(margin),
+  }))
   const [syntaxHighlight, setSyntaxHighlight] = useState(false)
   const [highlightResult, setHighlightResult] = useState<{ source: string; spans: SyntaxSpan[] } | null>(null)
   const [highlightStatus, setHighlightStatus] = useState<'idle' | 'working' | 'ready' | 'unsupported' | 'error'>('idle')
@@ -209,6 +217,24 @@ function App() {
     line_count_bucket: countBucket(normalizedText.trim() ? normalizedText.split('\n').length : 0),
     page_count: pages.length,
   })
+  const updateNumericDraft = (key: NumericDraftKey, value: string) => {
+    setNumericDrafts((current) => ({ ...current, [key]: value }))
+  }
+  const commitNumericDraft = (
+    key: NumericDraftKey,
+    rawValue: string,
+    currentValue: number,
+    min: number,
+    max: number,
+    updateValue: (value: number) => void,
+    setting: string,
+  ) => {
+    const parsed = rawValue.trim() === '' ? currentValue : Number(rawValue)
+    const nextValue = Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : currentValue
+    updateValue(nextValue)
+    updateNumericDraft(key, String(nextValue))
+    if (nextValue !== currentValue) trackEvent('setting_changed', { setting, value: nextValue })
+  }
   const closeDialog = useCallback((source: 'button' | 'backdrop' | 'escape' = 'button') => {
     const dialog = dialogRef.current
     if (!dialog?.open || dialog.classList.contains('is-closing')) return
@@ -333,11 +359,11 @@ function App() {
             <label className="control"><span>内容纸张</span><select value={paper} onChange={(e) => { const value = e.target.value as Paper; setPaper(value); trackEvent('setting_changed', { setting: 'paper', value }) }}><option>A3</option><option>A4</option><option>A5</option><option>A6</option><option>Letter</option><option value="custom">自定义</option></select></label>
             <label className="control"><span>方向</span><select value={orientation} onChange={(e) => { const value = e.target.value as Orientation; setOrientation(value); trackEvent('setting_changed', { setting: 'orientation', value }) }}><option value="portrait">纵向</option><option value="landscape">横向</option></select></label>
             <label className="control"><span>分列</span><select value={columns} onChange={(e) => { const value = Number(e.target.value); setColumns(value); trackEvent('setting_changed', { setting: 'columns', value }) }}><option value={1}>单列</option><option value={2}>两列</option><option value={3}>三列</option></select></label>
-            {columns > 1 && <label className="control"><span>列间距 / mm</span><input type="number" min="0" max="30" value={columnGap} onChange={(e) => setColumnGap(Number(e.target.value))} onBlur={(e) => trackEvent('setting_changed', { setting: 'column_gap_mm', value: Number(e.currentTarget.value) })} /></label>}
-            {paper === 'custom' && <div className="control custom-size"><span>内容尺寸 / mm</span><div className="paired-input"><input type="number" min="50" max="420" value={customWidth} onChange={(e) => setCustomWidth(Number(e.target.value))} onBlur={(e) => trackEvent('setting_changed', { setting: 'custom_width_mm', value: Number(e.currentTarget.value) })} aria-label="内容宽度，毫米" /><span>×</span><input type="number" min="50" max="420" value={customHeight} onChange={(e) => setCustomHeight(Number(e.target.value))} onBlur={(e) => trackEvent('setting_changed', { setting: 'custom_height_mm', value: Number(e.currentTarget.value) })} aria-label="内容高度，毫米" /></div></div>}
+            {columns > 1 && <label className="control"><span>列间距 / mm</span><input type="number" min="0" max="30" value={numericDrafts.columnGap} onChange={(e) => updateNumericDraft('columnGap', e.target.value)} onBlur={(e) => commitNumericDraft('columnGap', e.currentTarget.value, columnGap, 0, 30, setColumnGap, 'column_gap_mm')} /></label>}
+            {paper === 'custom' && <div className="control custom-size"><span>内容尺寸 / mm</span><div className="paired-input"><input type="number" min="50" max="420" value={numericDrafts.customWidth} onChange={(e) => updateNumericDraft('customWidth', e.target.value)} onBlur={(e) => commitNumericDraft('customWidth', e.currentTarget.value, customWidth, 50, 420, setCustomWidth, 'custom_width_mm')} aria-label="内容宽度，毫米" /><span>×</span><input type="number" min="50" max="420" value={numericDrafts.customHeight} onChange={(e) => updateNumericDraft('customHeight', e.target.value)} onBlur={(e) => commitNumericDraft('customHeight', e.currentTarget.value, customHeight, 50, 420, setCustomHeight, 'custom_height_mm')} aria-label="内容高度，毫米" /></div></div>}
             <label className="control"><span>字体</span><select value={font} onChange={(e) => { const value = e.target.value as typeof font; setFont(value); trackEvent('setting_changed', { setting: 'font', value }) }}>{FONTS.map((item) => <option value={item.value} key={item.value}>{item.label}</option>)}</select></label>
-            <label className="control"><span>字号 / pt</span><input type="number" min="6" max="72" value={fontSize} onChange={(e) => setFontSize(Math.min(72, Math.max(6, Number(e.target.value) || 6)))} onBlur={() => trackEvent('setting_changed', { setting: 'font_size_pt', value: fontSize })} /></label>
-            <label className="control"><span>页边距 / mm</span><input type="number" min="0" max="100" value={margin} onChange={(e) => setMargin(Number(e.target.value))} onBlur={() => trackEvent('setting_changed', { setting: 'margin_mm', value: margin })} /></label>
+            <label className="control"><span>字号 / pt</span><input type="number" min="6" max="72" value={numericDrafts.fontSize} onChange={(e) => updateNumericDraft('fontSize', e.target.value)} onBlur={(e) => commitNumericDraft('fontSize', e.currentTarget.value, fontSize, 6, 72, setFontSize, 'font_size_pt')} /></label>
+            <label className="control"><span>页边距 / mm</span><input type="number" min="0" max="100" value={numericDrafts.margin} onChange={(e) => updateNumericDraft('margin', e.target.value)} onBlur={(e) => commitNumericDraft('margin', e.currentTarget.value, margin, 0, 100, setMargin, 'margin_mm')} /></label>
             <label className="control color-control"><span>文字颜色</span><span className="color-input"><input type="color" value={color} onChange={(e) => setColor(e.target.value)} onBlur={(e) => trackEvent('setting_changed', { setting: 'text_color', value: e.currentTarget.value })} aria-label="文字颜色" /><span>{color.toUpperCase()}</span></span></label>
             <label className="control"><span>页尾</span><select value={footerMode} onChange={(e) => { const value = e.target.value as FooterMode; setFooterMode(value); trackEvent('setting_changed', { setting: 'footer_mode', value }) }}><option value="none">关闭</option><option value="page">仅页数</option><option value="all">全部（站点、日期、页数）</option></select></label>
           </div>
