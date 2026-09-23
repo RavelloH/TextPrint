@@ -1,5 +1,6 @@
 import { Printer, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { countBucket, durationBucket, trackEvent } from './analytics'
 import './App.css'
 
 type Paper = 'A3' | 'A4' | 'A5' | 'A6' | 'Letter' | 'custom'
@@ -99,6 +100,8 @@ function App() {
   const [pdfStatus, setPdfStatus] = useState<'idle' | 'working' | 'ready' | 'error'>('idle')
   const dialogRef = useRef<HTMLDialogElement>(null)
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const previewOpenedAtRef = useRef<number | null>(null)
+  const highlightUnsupportedTrackedRef = useRef(false)
   const normalizedText = text.replace(/\r\n?/g, '\n').replace(/\t/g, '    ')
   const spans = syntaxHighlight && highlightStatus === 'ready' && highlightResult?.source === normalizedText ? highlightResult.spans : EMPTY_SPANS
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
@@ -106,14 +109,21 @@ function App() {
   useEffect(() => {
     if (!syntaxHighlight || !normalizedText.trim()) {
       setHighlightStatus('idle')
+      highlightUnsupportedTrackedRef.current = false
       return
     }
     if (!('gpu' in navigator)) {
       setHighlightStatus('unsupported')
+      if (!highlightUnsupportedTrackedRef.current) {
+        trackEvent('syntax_highlight_unavailable', { reason: 'webgpu_unsupported' })
+        highlightUnsupportedTrackedRef.current = true
+      }
       return
     }
     let cancelled = false
+    const startedAt = performance.now()
     setHighlightStatus('working')
+    trackEvent('syntax_highlight_started')
     const timer = setTimeout(async () => {
       try {
         const { parse } = await import('gpu-lexer')
@@ -121,17 +131,27 @@ function App() {
         if (!cancelled) {
           setHighlightResult({ source: normalizedText, spans: result })
           setHighlightStatus('ready')
+          trackEvent('syntax_highlight_completed', { duration_bucket: durationBucket(performance.now() - startedAt) })
         }
       } catch {
-        if (!cancelled) setHighlightStatus('error')
+        if (!cancelled) {
+          setHighlightStatus('error')
+          trackEvent('syntax_highlight_failed', { reason: 'parser_error', duration_bucket: durationBucket(performance.now() - startedAt) })
+        }
       }
     }, 180)
     return () => { cancelled = true; clearTimeout(timer) }
   }, [syntaxHighlight, normalizedText])
 
-  const closeDialog = useCallback(() => {
+  const closeDialog = useCallback((source: 'button' | 'backdrop' | 'escape' = 'button') => {
     const dialog = dialogRef.current
     if (!dialog?.open || dialog.classList.contains('is-closing')) return
+    const openedAt = previewOpenedAtRef.current
+    trackEvent('preview_closed', {
+      source,
+      duration_bucket: openedAt === null ? 'unknown' : durationBucket(performance.now() - openedAt),
+    })
+    previewOpenedAtRef.current = null
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { dialog.close(); setPreviewOpen(false); return }
     dialog.classList.add('is-closing')
     closeTimerRef.current = setTimeout(() => {
@@ -171,33 +191,85 @@ function App() {
   }, [normalizedText, columnWidth, contentHeight, fontSize, family, columns])
   const footerDate = new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
   const footerHost = window.location.hostname
+  const analyticsLayout = () => ({
+    paper,
+    orientation,
+    width_mm: safeWidth,
+    height_mm: safeHeight,
+    margin_mm: safeMargin,
+    columns,
+    column_gap_mm: columns > 1 ? columnGap : 0,
+    font,
+    font_size_pt: fontSize,
+    text_color: color,
+    alignment,
+    footer_mode: footerMode,
+    syntax_highlight: syntaxHighlight,
+    text_length_bucket: countBucket(normalizedText.length),
+    line_count_bucket: countBucket(normalizedText.trim() ? normalizedText.split('\n').length : 0),
+    page_count: pages.length,
+  })
   useEffect(() => {
     if (!isIOS || !previewOpen || (syntaxHighlight && highlightStatus === 'working')) return
     let cancelled = false
+    const startedAt = performance.now()
     setPdfStatus('working')
     setPdfBlob(null)
+    trackEvent('pdf_generation_started', { page_count: pages.length, resolution_dpi: 220 })
     import('./printPdf').then(({ createPrintPdf }) => createPrintPdf({
       pages, spans, paper, width: safeWidth, height: safeHeight, margin: safeMargin,
       columns, columnGap, columnWidth, fontSize, family, color, alignment,
       footerMode, footerDate, footerHost, syntaxColors: SYNTAX_COLORS,
     })).then((blob) => {
-      if (!cancelled) { setPdfBlob(blob); setPdfStatus('ready') }
-    }).catch(() => { if (!cancelled) setPdfStatus('error') })
+      if (!cancelled) {
+        setPdfBlob(blob)
+        setPdfStatus('ready')
+        trackEvent('pdf_generation_succeeded', { page_count: pages.length, duration_bucket: durationBucket(performance.now() - startedAt) })
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setPdfStatus('error')
+        trackEvent('pdf_generation_failed', { page_count: pages.length, duration_bucket: durationBucket(performance.now() - startedAt) })
+      }
+    })
     return () => { cancelled = true }
   }, [isIOS, previewOpen, syntaxHighlight, highlightStatus, pages, spans, paper, safeWidth, safeHeight, safeMargin, columns, columnGap, columnWidth, fontSize, family, color, alignment, footerMode, footerDate, footerHost])
 
   const print = async () => {
-    if (!isIOS) { window.print(); return }
+    if (!isIOS) {
+      trackEvent('system_print_requested', analyticsLayout())
+      window.print()
+      return
+    }
     if (!pdfBlob) return
     const file = new File([pdfBlob], 'TextPrint.pdf', { type: 'application/pdf' })
     if (navigator.canShare?.({ files: [file] }) && navigator.share) {
-      try { await navigator.share({ files: [file] }) }
-      catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) setPdfStatus('error') }
+      trackEvent('pdf_share_started', { page_count: pages.length })
+      try {
+        await navigator.share({ files: [file] })
+        trackEvent('pdf_share_completed', { page_count: pages.length })
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          trackEvent('pdf_share_cancelled', { page_count: pages.length })
+        } else {
+          setPdfStatus('error')
+          trackEvent('pdf_share_failed', { page_count: pages.length, reason: 'share_error' })
+        }
+      }
     } else {
       const url = URL.createObjectURL(pdfBlob)
       window.open(url, '_blank', 'noopener')
+      trackEvent('pdf_fallback_open_requested', { page_count: pages.length })
       setTimeout(() => URL.revokeObjectURL(url), 60_000)
     }
+  }
+  const openPreview = () => {
+    previewOpenedAtRef.current = performance.now()
+    trackEvent('preview_opened', analyticsLayout())
+    setPdfBlob(null)
+    setPdfStatus('working')
+    dialogRef.current?.showModal()
+    setPreviewOpen(true)
   }
   const footer = (index: number, preview: boolean) => footerMode === 'none' ? null : (
     <div className={`paper-footer ${preview ? 'preview-footer' : 'printed-footer'} ${footerMode === 'page' ? 'only-page' : ''}`}
@@ -225,20 +297,20 @@ function App() {
         <section className="settings-section" aria-label="排版设置">
           <div className="section-heading">02 / 排版设置</div>
           <div className="settings-grid">
-            <label className="control"><span>内容纸张</span><select value={paper} onChange={(e) => setPaper(e.target.value as Paper)}><option>A3</option><option>A4</option><option>A5</option><option>A6</option><option>Letter</option><option value="custom">自定义</option></select></label>
-            <label className="control"><span>方向</span><select value={orientation} onChange={(e) => setOrientation(e.target.value as Orientation)}><option value="portrait">纵向</option><option value="landscape">横向</option></select></label>
-            <label className="control"><span>分列</span><select value={columns} onChange={(e) => setColumns(Number(e.target.value))}><option value={1}>单列</option><option value={2}>两列</option><option value={3}>三列</option></select></label>
-            {columns > 1 && <label className="control"><span>列间距 / mm</span><input type="number" min="0" max="30" value={columnGap} onChange={(e) => setColumnGap(Number(e.target.value))} /></label>}
-            {paper === 'custom' && <div className="control custom-size"><span>内容尺寸 / mm</span><div className="paired-input"><input type="number" min="50" max="420" value={customWidth} onChange={(e) => setCustomWidth(Number(e.target.value))} aria-label="内容宽度，毫米" /><span>×</span><input type="number" min="50" max="420" value={customHeight} onChange={(e) => setCustomHeight(Number(e.target.value))} aria-label="内容高度，毫米" /></div></div>}
-            <label className="control"><span>字体</span><select value={font} onChange={(e) => setFont(e.target.value as typeof font)}>{FONTS.map((item) => <option value={item.value} key={item.value}>{item.label}</option>)}</select></label>
-            <label className="control"><span>字号 / pt</span><input type="number" min="6" max="72" value={fontSize} onChange={(e) => setFontSize(Math.min(72, Math.max(6, Number(e.target.value) || 6)))} /></label>
-            <label className="control"><span>页边距 / mm</span><input type="number" min="0" max="100" value={margin} onChange={(e) => setMargin(Number(e.target.value))} /></label>
-            <label className="control color-control"><span>文字颜色</span><span className="color-input"><input type="color" value={color} onChange={(e) => setColor(e.target.value)} aria-label="文字颜色" /><span>{color.toUpperCase()}</span></span></label>
-            <label className="control"><span>页尾</span><select value={footerMode} onChange={(e) => setFooterMode(e.target.value as FooterMode)}><option value="none">关闭</option><option value="page">仅页数</option><option value="all">全部（站点、日期、页数）</option></select></label>
+            <label className="control"><span>内容纸张</span><select value={paper} onChange={(e) => { const value = e.target.value as Paper; setPaper(value); trackEvent('setting_changed', { setting: 'paper', value }) }}><option>A3</option><option>A4</option><option>A5</option><option>A6</option><option>Letter</option><option value="custom">自定义</option></select></label>
+            <label className="control"><span>方向</span><select value={orientation} onChange={(e) => { const value = e.target.value as Orientation; setOrientation(value); trackEvent('setting_changed', { setting: 'orientation', value }) }}><option value="portrait">纵向</option><option value="landscape">横向</option></select></label>
+            <label className="control"><span>分列</span><select value={columns} onChange={(e) => { const value = Number(e.target.value); setColumns(value); trackEvent('setting_changed', { setting: 'columns', value }) }}><option value={1}>单列</option><option value={2}>两列</option><option value={3}>三列</option></select></label>
+            {columns > 1 && <label className="control"><span>列间距 / mm</span><input type="number" min="0" max="30" value={columnGap} onChange={(e) => setColumnGap(Number(e.target.value))} onBlur={(e) => trackEvent('setting_changed', { setting: 'column_gap_mm', value: Number(e.currentTarget.value) })} /></label>}
+            {paper === 'custom' && <div className="control custom-size"><span>内容尺寸 / mm</span><div className="paired-input"><input type="number" min="50" max="420" value={customWidth} onChange={(e) => setCustomWidth(Number(e.target.value))} onBlur={(e) => trackEvent('setting_changed', { setting: 'custom_width_mm', value: Number(e.currentTarget.value) })} aria-label="内容宽度，毫米" /><span>×</span><input type="number" min="50" max="420" value={customHeight} onChange={(e) => setCustomHeight(Number(e.target.value))} onBlur={(e) => trackEvent('setting_changed', { setting: 'custom_height_mm', value: Number(e.currentTarget.value) })} aria-label="内容高度，毫米" /></div></div>}
+            <label className="control"><span>字体</span><select value={font} onChange={(e) => { const value = e.target.value as typeof font; setFont(value); trackEvent('setting_changed', { setting: 'font', value }) }}>{FONTS.map((item) => <option value={item.value} key={item.value}>{item.label}</option>)}</select></label>
+            <label className="control"><span>字号 / pt</span><input type="number" min="6" max="72" value={fontSize} onChange={(e) => setFontSize(Math.min(72, Math.max(6, Number(e.target.value) || 6)))} onBlur={() => trackEvent('setting_changed', { setting: 'font_size_pt', value: fontSize })} /></label>
+            <label className="control"><span>页边距 / mm</span><input type="number" min="0" max="100" value={margin} onChange={(e) => setMargin(Number(e.target.value))} onBlur={() => trackEvent('setting_changed', { setting: 'margin_mm', value: margin })} /></label>
+            <label className="control color-control"><span>文字颜色</span><span className="color-input"><input type="color" value={color} onChange={(e) => setColor(e.target.value)} onBlur={(e) => trackEvent('setting_changed', { setting: 'text_color', value: e.currentTarget.value })} aria-label="文字颜色" /><span>{color.toUpperCase()}</span></span></label>
+            <label className="control"><span>页尾</span><select value={footerMode} onChange={(e) => { const value = e.target.value as FooterMode; setFooterMode(value); trackEvent('setting_changed', { setting: 'footer_mode', value }) }}><option value="none">关闭</option><option value="page">仅页数</option><option value="all">全部（站点、日期、页数）</option></select></label>
           </div>
-          <div className="align-row"><span>对齐</span><div className="segmented" role="group" aria-label="文字对齐">{([['left','左对齐'],['center','居中'],['right','右对齐']] as const).map(([value,label]) => <button type="button" key={value} className={alignment === value ? 'active' : ''} onClick={() => setAlignment(value)} aria-pressed={alignment === value}>{label}</button>)}</div></div>
+          <div className="align-row"><span>对齐</span><div className="segmented" role="group" aria-label="文字对齐">{([['left','左对齐'],['center','居中'],['right','右对齐']] as const).map(([value,label]) => <button type="button" key={value} className={alignment === value ? 'active' : ''} onClick={() => { setAlignment(value); trackEvent('setting_changed', { setting: 'alignment', value }) }} aria-pressed={alignment === value}>{label}</button>)}</div></div>
           <div className="highlight-row">
-            <label className="highlight-option"><input type="checkbox" checked={syntaxHighlight} onChange={(event) => setSyntaxHighlight(event.target.checked)} /><span className="setting-check" aria-hidden="true">{syntaxHighlight ? '✓' : ''}</span><span>语法高亮</span></label>
+            <label className="highlight-option"><input type="checkbox" checked={syntaxHighlight} onChange={(event) => { const enabled = event.target.checked; setSyntaxHighlight(enabled); trackEvent('syntax_highlight_toggled', { enabled }) }} /><span className="setting-check" aria-hidden="true">{syntaxHighlight ? '✓' : ''}</span><span>语法高亮</span></label>
             {syntaxHighlight && highlightStatus === 'working' && <p className="highlight-status" role="status">正在分析文字…</p>}
             {syntaxHighlight && highlightStatus === 'unsupported' && <p className="highlight-status" role="status">当前浏览器不支持 WebGPU</p>}
             {syntaxHighlight && highlightStatus === 'error' && <p className="highlight-status" role="status">高亮未能运行</p>}
@@ -246,16 +318,16 @@ function App() {
           {!isIOS && <p className="print-setting-note">浏览器自带的页眉页脚需在系统打印窗口中另行关闭。</p>}
           {!validDimensions && <p className="error" role="alert">请检查纸张尺寸、页边距与列间距，确保每列至少有 12 mm 宽度。</p>}
         </section>
-        <button className="print-button" type="button" onClick={() => { setPdfBlob(null); setPdfStatus('working'); dialogRef.current?.showModal(); setPreviewOpen(true) }} disabled={!text.trim() || !validDimensions}>
+        <button className="print-button" type="button" onClick={openPreview} disabled={!text.trim() || !validDimensions}>
           <span>预览并打印</span><Printer size={19} strokeWidth={1.9} />
         </button>
         <footer className="author-credit">Made by <a href="https://github.com/RavelloH" target="_blank" rel="noreferrer">RavelloH ↗</a></footer>
       </main>
-      <dialog className="preview-dialog" ref={dialogRef} aria-labelledby="preview-title" onClick={(event) => { if (event.target === dialogRef.current) closeDialog() }} onCancel={(event) => { event.preventDefault(); closeDialog() }}>
+      <dialog className="preview-dialog" ref={dialogRef} aria-labelledby="preview-title" onClick={(event) => { if (event.target === dialogRef.current) closeDialog('backdrop') }} onCancel={(event) => { event.preventDefault(); closeDialog('escape') }}>
         <div className="preview-dialog-inner">
           <header className="dialog-header">
             <div><p className="eyebrow">TEXT / PRINT</p><h2 id="preview-title">打印预览</h2><p>{safeWidth} × {safeHeight} mm · {pages.length} 页</p></div>
-            <button className="dialog-close" type="button" aria-label="关闭预览" onClick={closeDialog}><X size={20} /></button>
+            <button className="dialog-close" type="button" aria-label="关闭预览" onClick={() => closeDialog('button')}><X size={20} /></button>
           </header>
           <div className="preview-list">
             {pages.map((pageColumns, index) => <div className="preview-entry" key={index}>
