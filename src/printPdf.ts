@@ -1,4 +1,4 @@
-type Line = { value: string; start: number; end: number }
+type Line = { value: string; start: number; end: number; lineNumber: number | null }
 type Span = { type: string; start: number; end: number }
 type Footer = 'none' | 'page' | 'all'
 
@@ -13,6 +13,8 @@ export type PdfLayout = {
   columnGap: number
   columnWidth: number
   fontSize: number
+  showLineNumbers: boolean
+  lineNumberGutterEm: number
   family: string
   color: string
   alignment: 'left' | 'center' | 'right'
@@ -56,13 +58,25 @@ export async function createPrintPdf(layout: PdfLayout): Promise<Blob> {
     const startX = (offsetX + layout.margin) * pixelsPerMm
     const startY = (offsetY + layout.margin) * pixelsPerMm
     const columnWidthPx = layout.columnWidth * pixelsPerMm
+    const lineNumberGutterPx = layout.showLineNumbers ? layout.lineNumberGutterEm * fontPx : 0
+    const lineNumberGapPx = layout.showLineNumbers ? fontPx * 0.3 : 0
+    const textWidthPx = columnWidthPx - lineNumberGutterPx - lineNumberGapPx
 
     page.forEach((lines, columnIndex) => {
       const columnX = startX + columnIndex * (layout.columnWidth + layout.columnGap) * pixelsPerMm
       lines.forEach((line, lineIndex) => {
         const lineWidth = context.measureText(line.value).width
-        let x = columnX + (layout.alignment === 'center' ? (columnWidthPx - lineWidth) / 2 : layout.alignment === 'right' ? columnWidthPx - lineWidth : 0)
+        let x = columnX + lineNumberGutterPx + lineNumberGapPx
+          + (layout.alignment === 'center' ? (textWidthPx - lineWidth) / 2 : layout.alignment === 'right' ? textWidthPx - lineWidth : 0)
         const y = startY + lineIndex * lineHeightPx
+        if (layout.showLineNumbers && line.lineNumber !== null) {
+          context.font = `${fontPx * 0.8}px 'Cascadia Mono', 'SFMono-Regular', Consolas, monospace`
+          context.fillStyle = '#9ba7a8'
+          context.textAlign = 'right'
+          context.fillText(String(line.lineNumber), columnX + lineNumberGutterPx, y + fontPx * 0.12)
+          context.textAlign = 'left'
+          context.font = `${fontPx}px ${layout.family}`
+        }
         let position = line.start
         for (const span of layout.spans) {
           if (span.end <= position) continue

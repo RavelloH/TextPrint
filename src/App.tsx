@@ -19,7 +19,7 @@ const FONTS = [
 const pxPerMm = 96 / 25.4
 const pxPerPt = 96 / 72
 const EMPTY_SPANS: SyntaxSpan[] = []
-type WrappedLine = { value: string; start: number; end: number }
+type WrappedLine = { value: string; start: number; end: number; lineNumber: number | null }
 type SyntaxSpan = { type: 'plain' | 'comment' | 'string' | 'number' | 'keyword' | 'type' | 'function' | 'constant' | 'operator'; start: number; end: number }
 const SYNTAX_COLORS: Record<SyntaxSpan['type'], string | undefined> = {
   plain: undefined, comment: '#637581', string: '#9a542e', number: '#8155ad',
@@ -29,18 +29,27 @@ const SYNTAX_COLORS: Record<SyntaxSpan['type'], string | undefined> = {
 
 function linesForText(text: string, maxWidthPx: number, font: string): WrappedLine[] {
   const context = document.createElement('canvas').getContext('2d')
-  if (!context) return [{ value: text, start: 0, end: text.length }]
+  if (!context) {
+    let start = 0
+    return text.split('\n').map((value, index) => {
+      const line = { value, start, end: start + value.length, lineNumber: index + 1 }
+      start += value.length + 1
+      return line
+    })
+  }
   context.font = font
   const lines: WrappedLine[] = []
   const segmenter = typeof Intl.Segmenter === 'function'
     ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null
   let paragraphStart = 0
+  let sourceLineNumber = 1
   for (const paragraph of text.replace(/\r\n?/g, '\n').replace(/\t/g, '    ').split('\n')) {
     const chars = segmenter ? Array.from(segmenter.segment(paragraph), (part) => part.segment) : Array.from(paragraph)
     const offsets = [0]
     for (const char of chars) offsets.push(offsets[offsets.length - 1] + char.length)
     if (!chars.length) {
-      lines.push({ value: '', start: paragraphStart, end: paragraphStart })
+      lines.push({ value: '', start: paragraphStart, end: paragraphStart, lineNumber: sourceLineNumber })
+      sourceLineNumber++
       paragraphStart += 1
       continue
     }
@@ -54,9 +63,15 @@ function linesForText(text: string, maxWidthPx: number, font: string): WrappedLi
       }
       const fitted = Math.max(start + 1, end - 1)
       const split = fitted < chars.length && lastSpace > start ? lastSpace : fitted
-      lines.push({ value: chars.slice(start, split).join(''), start: paragraphStart + offsets[start], end: paragraphStart + offsets[split] })
+      lines.push({
+        value: chars.slice(start, split).join(''),
+        start: paragraphStart + offsets[start],
+        end: paragraphStart + offsets[split],
+        lineNumber: start === 0 ? sourceLineNumber : null,
+      })
       start = split
     }
+    sourceLineNumber++
     paragraphStart += paragraph.length + 1
   }
   return lines
@@ -79,6 +94,20 @@ function Line({ line, spans }: { line: WrappedLine; spans: SyntaxSpan[] }) {
   return <>{fragments}</>
 }
 
+function LineRow({ line, spans, className, showLineNumbers, gutterWidthEm }: {
+  line: WrappedLine
+  spans: SyntaxSpan[]
+  className: string
+  showLineNumbers: boolean
+  gutterWidthEm: number
+}) {
+  return <div className={`${className}${showLineNumbers ? ' numbered-line' : ''}`}
+    style={showLineNumbers ? { gridTemplateColumns: `${gutterWidthEm}em minmax(0, 1fr)` } : undefined}>
+    {showLineNumbers && <span className="line-number" aria-hidden="true">{line.lineNumber ?? ''}</span>}
+    <span className="line-body"><Line line={line} spans={spans} /></span>
+  </div>
+}
+
 function App() {
   const [text, setText] = useState('')
   const [paper, setPaper] = useState<Paper>('A4')
@@ -93,6 +122,7 @@ function App() {
   const [fontSize, setFontSize] = useState(12)
   const [color, setColor] = useState('#1a1d20')
   const [alignment, setAlignment] = useState<Alignment>('left')
+  const [showLineNumbers, setShowLineNumbers] = useState(false)
   const [numericDrafts, setNumericDrafts] = useState<Record<NumericDraftKey, string>>(() => ({
     columnGap: String(columnGap),
     customWidth: String(customWidth),
@@ -181,22 +211,26 @@ function App() {
   const footerReserve = footerMode === 'none' ? 0 : 10
   const contentHeight = safeHeight - 2 * safeMargin - footerReserve
   const columnWidth = (contentWidth - (columns - 1) * columnGap) / columns
+  const logicalLineCount = normalizedText.split('\n').length
+  const lineNumberDigits = String(logicalLineCount).length
+  const lineNumberGutterEm = lineNumberDigits * 0.52 + 0.3
+  const lineNumberGutterMm = showLineNumbers ? (lineNumberGutterEm + 0.3) * fontSize * 25.4 / 72 : 0
   const validDimensions = width >= 50 && width <= 420 && height >= 50 && height <= 420
     && margin >= 0 && margin * 2 < Math.min(width, height)
-    && (columns === 1 || (columnGap >= 0 && columnGap <= 30)) && columnWidth >= 12 && contentHeight >= 12
+    && (columns === 1 || (columnGap >= 0 && columnGap <= 30)) && columnWidth - lineNumberGutterMm >= 12 && contentHeight >= 12
 
   const pages = useMemo(() => {
     if (!normalizedText) return [[[]]] as WrappedLine[][][]
     const lineHeightPx = fontSize * pxPerPt * 1.5
     const linesPerColumn = Math.max(1, Math.floor((contentHeight * pxPerMm - 2) / lineHeightPx))
-    const lines = linesForText(normalizedText, Math.max(1, columnWidth * pxPerMm - 3), `${fontSize * pxPerPt}px ${family}`)
+    const lines = linesForText(normalizedText, Math.max(1, (columnWidth - lineNumberGutterMm) * pxPerMm - 3), `${fontSize * pxPerPt}px ${family}`)
     const result: WrappedLine[][][] = []
     for (let i = 0; i < lines.length; i += linesPerColumn * columns) {
       result.push(Array.from({ length: columns }, (_, column) =>
         lines.slice(i + column * linesPerColumn, i + (column + 1) * linesPerColumn)))
     }
     return result
-  }, [normalizedText, columnWidth, contentHeight, fontSize, family, columns])
+  }, [normalizedText, columnWidth, lineNumberGutterMm, contentHeight, fontSize, family, columns])
   const footerDate = new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
   const footerHost = window.location.hostname
   const analyticsLayout = () => ({
@@ -213,6 +247,7 @@ function App() {
     alignment,
     footer_mode: footerMode,
     syntax_highlight: syntaxHighlight,
+    line_numbers: showLineNumbers,
     text_length_bucket: countBucket(normalizedText.length),
     line_count_bucket: countBucket(normalizedText.trim() ? normalizedText.split('\n').length : 0),
     page_count: pages.length,
@@ -268,7 +303,7 @@ function App() {
     pdfGenerationResultTrackedRef.current = false
     import('./printPdf').then(({ createPrintPdf }) => createPrintPdf({
       pages, spans, paper, width: safeWidth, height: safeHeight, margin: safeMargin,
-      columns, columnGap, columnWidth, fontSize, family, color, alignment,
+      columns, columnGap, columnWidth, fontSize, family, color, alignment, showLineNumbers, lineNumberGutterEm,
       footerMode, footerDate, footerHost, syntaxColors: SYNTAX_COLORS,
     })).then((blob) => {
       if (!cancelled && !pdfGenerationResultTrackedRef.current) {
@@ -285,7 +320,7 @@ function App() {
       }
     })
     return () => { cancelled = true }
-  }, [isIOS, previewOpen, syntaxHighlight, highlightStatus, pages, spans, paper, safeWidth, safeHeight, safeMargin, columns, columnGap, columnWidth, fontSize, family, color, alignment, footerMode, footerDate, footerHost])
+  }, [isIOS, previewOpen, syntaxHighlight, highlightStatus, pages, spans, paper, safeWidth, safeHeight, safeMargin, columns, columnGap, columnWidth, fontSize, family, color, alignment, showLineNumbers, lineNumberGutterEm, footerMode, footerDate, footerHost])
 
   const print = async () => {
     if (!isIOS) {
@@ -370,6 +405,7 @@ function App() {
           <div className="align-row"><span>对齐</span><div className="segmented" role="group" aria-label="文字对齐">{([['left','左对齐'],['center','居中'],['right','右对齐']] as const).map(([value,label]) => <button type="button" key={value} className={alignment === value ? 'active' : ''} onClick={() => { setAlignment(value); trackEvent('setting_changed', { setting: 'alignment', value }) }} aria-pressed={alignment === value}>{label}</button>)}</div></div>
           <div className="highlight-row">
             <label className="highlight-option"><input type="checkbox" checked={syntaxHighlight} onChange={(event) => setSyntaxHighlight(event.target.checked)} /><span className="setting-check" aria-hidden="true">{syntaxHighlight ? '✓' : ''}</span><span>语法高亮</span></label>
+            <label className="highlight-option"><input type="checkbox" checked={showLineNumbers} onChange={(event) => { const value = event.target.checked; setShowLineNumbers(value); trackEvent('setting_changed', { setting: 'line_numbers', value }) }} /><span className="setting-check" aria-hidden="true">{showLineNumbers ? '✓' : ''}</span><span>显示行号</span></label>
             {syntaxHighlight && highlightStatus === 'working' && <p className="highlight-status" role="status">正在分析文字…</p>}
             {syntaxHighlight && highlightStatus === 'unsupported' && <p className="highlight-status" role="status">当前浏览器不支持 WebGPU</p>}
             {syntaxHighlight && highlightStatus === 'error' && <p className="highlight-status" role="status">高亮未能运行</p>}
@@ -392,7 +428,7 @@ function App() {
             {pages.map((pageColumns, index) => <div className="preview-entry" key={index}>
               <div className="preview-paper" style={{ aspectRatio: `${safeWidth} / ${safeHeight}` }}>
                 <div className="preview-content" style={{ top: `${(safeMargin / safeHeight) * 100}%`, right: `${(safeMargin / safeWidth) * 100}%`, bottom: `${((safeMargin + footerReserve) / safeHeight) * 100}%`, left: `${(safeMargin / safeWidth) * 100}%`, gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, columnGap: `calc(100cqw * ${columnGap / safeWidth})`, fontFamily: family, color, textAlign: alignment, fontSize: `calc(100cqw * ${fontSize * pxPerPt / (safeWidth * pxPerMm)})` }}>
-                  {pageColumns.map((lines, col) => <div className="paper-column" key={col}>{lines.map((line, i) => <div key={i}><Line line={line} spans={spans} /></div>)}</div>)}
+                  {pageColumns.map((lines, col) => <div className="paper-column" key={col}>{lines.map((line, i) => <LineRow key={i} line={line} spans={spans} className="preview-line" showLineNumbers={showLineNumbers} gutterWidthEm={lineNumberGutterEm} />)}</div>)}
                 </div>
                 {footer(index, true)}
               </div><span className="page-number">{String(index + 1).padStart(2, '0')} / {String(pages.length).padStart(2, '0')}</span>
@@ -408,7 +444,7 @@ function App() {
       <div className="print-only" aria-hidden="true">
         {text.trim() && validDimensions && pages.map((pageColumns, index) => <div className="print-page" key={index} style={{ width: `${safeWidth}mm`, height: `${safeHeight}mm`, padding: `${safeMargin}mm`, fontFamily: family, fontSize: `${fontSize}pt`, color, textAlign: alignment }}>
           <div className="print-columns" style={{ height: `${contentHeight}mm`, gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, columnGap: `${columnGap}mm` }}>
-            {pageColumns.map((lines, col) => <div className="paper-column" key={col}>{lines.map((line, i) => <div className="print-line" key={i}><Line line={line} spans={spans} /></div>)}</div>)}
+            {pageColumns.map((lines, col) => <div className="paper-column" key={col}>{lines.map((line, i) => <LineRow key={i} line={line} spans={spans} className="print-line" showLineNumbers={showLineNumbers} gutterWidthEm={lineNumberGutterEm} />)}</div>)}
           </div>
           {footer(index, false)}
         </div>)}

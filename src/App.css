@@ -15,3 +15,4 @@
 @media print{.print-setting-note,.page-number{display:none!important}}
 .highlight-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:18px}.highlight-row .highlight-option{flex:none;margin-top:0}.highlight-row .highlight-status{margin:0;text-align:right;font-size:12px;color:#829092}
 .ios-print-hint{margin:0 0 10px;color:#6f7e80;font-size:12px;line-height:1.5}.dialog-footer .error{margin:0 0 10px}
+.highlight-row{justify-content:flex-start;flex-wrap:wrap}.highlight-row .highlight-status{margin-left:auto}.numbered-line{display:grid;align-items:baseline;column-gap:.3em}.line-number{overflow:hidden;color:#9ba7a8;font-family:'Cascadia Mono','SFMono-Regular',Consolas,monospace;font-size:.8em;text-align:right;user-select:none}.line-body{min-width:0;white-space:pre}
